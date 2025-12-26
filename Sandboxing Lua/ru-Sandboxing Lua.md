@@ -1213,7 +1213,7 @@ end
 Если прям совсем упростить, то весь требуемый функционал — выделение, удаление и изменение размера уже выделенного блока — реализуется на коленке через `realloc` и `free`:
 
 ```cpp
-void * luaAlloc(void *ptr, size_t newSize)
+void *luaAlloc(void *ptr, size_t newSize)
 {
     if (newSize == 0) {
         free(ptr);
@@ -1229,62 +1229,119 @@ void * luaAlloc(void *ptr, size_t newSize)
 Более того, Lua нам существенно упрощает жизнь в плане реализации учёта, т.к. на самом деле в аллокатор передаются ещё два очень полезных для нас параметра:
 
 ```cpp
-void * luaAlloc(void *ud, void *ptr, size_t currSize, size_t newSize)
+void *luaAlloc(void *ud, void *ptr, size_t currSize, size_t newSize)
 ```
 `ud` — указатель на блок пользовательских данных, и `currSize` — текущий размер блока памяти, на который указывает `*ptr`.
 
-Причём, если с первым всё прозаично — мы можем указать Lua на любую структуру с произвольным набором переменных, которую хотим видеть в качестве аргумента в аллокаторе, то с текущим размером блока чуть сложнее.
+Причём, если с первым всё прозаично — мы можем указать Lua на любую структуру с произвольным набором переменных, которую хотим видеть в качестве аргумента в аллокаторе. То с текущим размером блока чуть сложнее.
 
-Дело в том, что он, как бы это сказать... он — не всегда размер. Если `*ptr` ссылается на уже выделенную память, то это размер. А вот если Lua запрашивает выделение нового блока памяти (`*ptr == NULL`), то он может принимать другие значения: например, код типа объекта который Lua сейчас пытается создать, ну так, чисто в качестве подсказки. По крайней мере, это справедливо для версий Lua 5.2+. Нас, вроде, не касается, но в целях унификации желательно эту особенность учитывать.
+Дело в том, что он, как бы это сказать... он — не всегда размер. Если `*ptr` ссылается на уже выделенную память, то это размер. А вот если Lua запрашивает выделение нового блока памяти (`*ptr == NULL`), то он может принимать другие значения: например, код типа объекта который Lua сейчас пытается создать, ну так, чисто в качестве подсказки. Имейте в виду — это поведение завезли только для Lua 5.2+. Можно смело пользоваться, если пишете навороченный аллокатор, оптимизирующий выделение памяти.
 
-Нужно только чтобы наш аллокатор удовлетворял ожиданиям Lua:
+Всё, что нам остаётся - обеспечить такое поведение нашего аллокатора, которое удовлетворяет ожиданиям Lua:
 
 | `*ptr` | `currSize` | `newSize` | ожидаемое поведение |
 |--------|------------|-----------|---------------------|
-| `NULL` |            | > 0       | Выделяем новый блок, запрошенного размера. Возвращаем указатель на него, либо `NULL` если выделить не удалось. |
-| `!NULL`| > 0        | 0         | Удаляем память на которую ссылается `ptr`. Возвращаем `NULL`.    |
-| `!NULL`| > 0        | > 0       | изменяем размер для запрошенного блока |
+| `NULL` | 0 либо код типа | > 0 | Выделяем новый блок запрошенного размера. Возвращаем указатель на него, либо `NULL` если выделить не удалось. |
+| `!NULL`| > 0 | 0 | Освобождаем память, на которую ссылается `ptr`. Возвращаем `NULL`. |
+| `!NULL`| > 0 | > 0 | Прикидываемся `realloc`'ом: изменяем размер блока, на который указывает `*ptr`, возвращаем указатель в случае успеха или `NULL`, если увеличить не удалось. |
 
+Сама же подмена осуществляется в момент создания Lua-стейта:
+```cpp
+void *limitedAlloc(void *ud, void *ptr, size_t currSize, size_t newSize);
 
+constexpr size_t cLualMemoryLimit = 1 * 1024 * 1024; // 1 Mb
 
+struct LuaAllocatorState
+{
+    size_t used {};
+    size_t limit {cLualMemoryLimit};
+} allocState;
+
+sol::state lua(sol::default_at_panic, limitedAlloc, &allocState);
+
+```
+Насчёт первого аргумента - `sol::default_at_panic` - не заморачиваемся, это дефолтный `sol`'овский обработчик ошибок типа "всё пропало". Просто в конструкторе он идёт первым, и мы вынуждены его указать явно, чтобы была возможность задать последние два аргумента.
 
 
 ```cpp
-constexpr size_t cLualMemoryLimit = 1 * 1024 * 1024; // 1 Mb
-
-struct AllocatorContext 
+namespace lua
 {
-    size_t used {};
-    size_t limit {cLuaMemoryLimit};
-}
+    namespace memory
+	{
+		constexpr size_t c1MB = 1L * 1024 * 1024;
+		constexpr size_t cDefaultMemLimit = c1MB;
 
-void * luaAlloc(void *ud, void *ptr, size_t currSize, size_t newSize)
+		struct LimitedAllocatorState
+		{
+			size_t used {};
+			size_t limit {cDefaultMemLimit};
+			bool limitReached {false}; // Добавили флаги для фиксации достижения лимита
+			bool overflow {false};     // и переполнения
+		};
+
+		void *limitedAlloc(void *ud, void *ptr, size_t currSize, size_t newSize) noexcept
+		{
+			auto *allocState = static_cast<LimitedAllocatorState*>(ud);
+
+			// Отакзываемся работать без указателя на состояние
+            if (allocState == nullptr) {
+				assert(allocState != nullptr);
+				return nullptr;
+			}
+
+			if (ptr == nullptr) {
+                // Здесь обработка подсказок насчёт типа объекта, который Lua пытается создать.
+                // ...
+                // И обнуляем currSize для того, чтобы дальше арифметика коректно работала.
+				currSize = 0;
+			}
+			if (newSize == 0) {
+				if (ptr != nullptr) {
+                    // Просто на всякий случай, чтобы не улететь ниже 0
+					allocState->used -= (allocState->used >= currSize) ? currSize
+																	   : allocState->used;
+				}
+				std::free(ptr);
+				return nullptr;
+			}
+            // Опять же, чтобы не свалиться ниже 0 при дальнейших расчётах
+			const size_t usedBase = (allocState->used >= currSize) ? allocState->used - currSize
+																   : 0;
+            // Защита от переполнения
+			if (newSize > (std::numeric_limits<size_t>::max() - usedBase)) {
+				allocState->overflow = true;
+				return nullptr;
+			}
+			const size_t newUsed = usedBase + newSize;
+			if (newUsed > allocState->limit) {
+				allocState->limitReached = true;
+				return nullptr;
+			}
+			void *newPtr = std::realloc(ptr, newSize);
+			if (newPtr != nullptr) {
+				allocState->used = newUsed;
+			}
+			return newPtr;
+		};
+	} // namespace memory
+} // namespace lua
+
+```
+```cpp
+class LuaRuntime
 {
-    auto *ctx = static_cast<AllocatorContext*>(ud);
+private:
+	lua::memory::LimitedAllocatorState allocatorState;
 
-    if (!ptr) {
-        currSize = 0;
-    }
-
-    if (newSize == 0) {
-        if (ptr) {
-            ctx->used -= currSize;
-        }
-        std::free(ptr);
-        return nullptr;
-    }
-
-    const size_t newUsed = ctx->used - currSize + newSize;
-
-    if (newUsed > ctx->limit) {
-        return nullptr;
-    }
-    void *newPtr = std::realloc(ptr, newSize);
-    if (newPtr) {
-        ctx->used = newUsed;
-    }
-    return newPtr;
-}
+public:
+    // Добавляем ещё один конструктор в LuaRuntime:
+    // и теперь можем создавать рантаймы с поддержкой лимитов на память
+	LuaRuntime(size_t memoryLimit)
+		: allocatorState({.limit = memoryLimit})
+		, state(sol::default_at_panic, lua::memory::limitedAlloc, &allocatorState)
+	{}
+    ...
+};
 ```
 
 
@@ -1298,7 +1355,6 @@ void * luaAlloc(void *ud, void *ptr, size_t currSize, size_t newSize)
 ## Что пока не охвачено данной реализацией.
 
 1. Защита от зависаний на стороне lua-скриптов: решается через хуки и таймауты — если скрипт выполняется дольше чем разрешено таймаутом, то скрипт просто прибивается. Да, это не решает проблему неработоспособности скрипта, но, по крайней мере, даёт возможность нашему движку отработать ошибку и работать дальше, не вылетев из-за кривого мода/карты. 
-2. Защита от отжора памяти.
-3. Механизм контроля целостности доверенных скриптов — например, скриптов, поставляемых нами самими. Со скриптами модов пользователь может делать что угодно, но для гарантированной работоспособности движка родные скрипты трогать не стоит.
-4. Hotreload — по факту изменения.
+2. Механизм контроля целостности доверенных скриптов — например, скриптов, поставляемых нами самими. Со скриптами модов пользователь может делать что угодно, но для гарантированной работоспособности движка родные скрипты трогать не стоит.
+3. Hotreload — по факту изменения.
 
